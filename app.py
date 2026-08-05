@@ -2552,6 +2552,7 @@ def build_email_html(
     irr_oil_bid_heatmap,
     irr_gas_bid_heatmap,
     irr_oil_gas_heatmap,
+    irr_gas_dc_heatmap,
     irr_heatmap,
     irr_tcrisk_bid_heatmap,
     irr_ngl_yield_bid_heatmap,
@@ -2636,6 +2637,24 @@ def build_email_html(
                     width=1100,
                     height=450,
                     title="Gas Price IRR",
+                    max_width_px=760,
+                )}
+            </td>
+        </tr>
+        <tr>
+            <td
+                colspan="2"
+                style="
+                    vertical-align:top;
+                    padding:12px 8px 0 8px;
+                    text-align:center;
+                "
+            >
+                {html_img_from_fig(
+                    irr_gas_dc_heatmap,
+                    width=1100,
+                    height=450,
+                    title="Gas Price vs. D&C Costs IRR",
                     max_width_px=760,
                 )}
             </td>
@@ -4134,6 +4153,20 @@ if (
                 "base_y": main_base,
             },
             {
+                "key": "gas_dc",
+                "title": "Gas Price vs. D&C Costs Sensitivity",
+                "x_values": gas_values,
+                "x_variable": "gas",
+                "y_values": dc_values,
+                "y_variable": "dc",
+                "x_title": "Gas Price ($/mcf)",
+                "y_title": "D&C Costs ($/ft)",
+                "x_format": "dollar",
+                "y_format": "dollar",
+                "base_x": deal_inputs["gas_price"],
+                "base_y": base_dc,
+            },
+            {
                 "key": "oil_gas",
                 "title": "Oil Price vs. Gas Price Sensitivity",
                 "x_values": oil_values,
@@ -4512,6 +4545,7 @@ if (
                 irr_oil_bid_heatmap=sensitivity_irr_heatmaps.get("oil_main"),
                 irr_gas_bid_heatmap=sensitivity_irr_heatmaps.get("gas_main"),
                 irr_oil_gas_heatmap=sensitivity_irr_heatmaps.get("oil_gas"),
+                irr_gas_dc_heatmap=sensitivity_irr_heatmaps.get("gas_dc"),
                 irr_heatmap=sensitivity_irr_heatmaps.get("dc_main"),
                 irr_tcrisk_bid_heatmap=sensitivity_irr_heatmaps.get("cross_main"),
                 irr_ngl_yield_bid_heatmap=sensitivity_irr_heatmaps.get("ngl_main"),
