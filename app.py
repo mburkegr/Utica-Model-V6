@@ -357,6 +357,23 @@ def next_month_start():
     return date(today.year, today.month + 1, 1)
 
 
+def default_flat_start_date():
+    """Return the first day of the month exactly 48 months from now.
+
+    Example:
+        August 2026 -> August 1, 2030
+    """
+    current_month = (
+        pd.Timestamp(date.today())
+        .to_period("M")
+        .to_timestamp()
+    )
+    return (
+        current_month
+        + pd.DateOffset(months=48)
+    ).date()
+
+
 def build_slot_template(num_slots):
     rows = []
     for i in range(1, num_slots + 1):
@@ -2760,7 +2777,7 @@ def build_email_html(
 # Bump this value whenever the editor schema or stored model-result schema
 # changes. Streamlit can retain old widget/session values across a hot reload,
 # which may leave the page blank or stuck after a deployment.
-APP_STATE_VERSION = "on-demand-sensitivities-v1"
+APP_STATE_VERSION = "monthly-pricing-defaults-v2"
 
 if st.session_state.get("_app_state_version") != APP_STATE_VERSION:
     # Clear stale data-editor widget state and prior calculated outputs.
@@ -2949,7 +2966,7 @@ st.sidebar.subheader("Pricing")
 
 use_monthly_pricing_file = st.sidebar.toggle(
     "Use Monthly Pricing File",
-    value=False,
+    value=True,
     key="use_monthly_pricing_file",
     help=(
         "Off = use flat oil and gas prices for the entire model. "
@@ -2971,7 +2988,7 @@ if pricing_mode == "flat":
         oil_price = st.number_input(
             "Oil Price ($/bbl)",
             min_value=0.0,
-            value=60.0,
+            value=70.0,
             step=1.0,
             format="%.2f",
             key="flat_mode_oil_price",
@@ -3009,16 +3026,37 @@ else:
         pricing_preview_df["month"].max()
     )
 
-    default_flat_start = (
+    # The transition month can be no later than the first month after the
+    # final month included in the monthly pricing file.
+    latest_allowed_flat_start = (
         last_pricing_month
         + pd.offsets.MonthBegin(1)
     ).date()
+
+    requested_default_flat_start = (
+        default_flat_start_date()
+    )
+
+    # Use the true 48-month default whenever the pricing file extends far
+    # enough. Otherwise, use the latest valid transition month.
+    default_flat_start = min(
+        requested_default_flat_start,
+        latest_allowed_flat_start,
+    )
 
     st.sidebar.caption(
         "Pricing file range: "
         f"{first_pricing_month:%b %Y} through "
         f"{last_pricing_month:%b %Y}"
     )
+
+    if requested_default_flat_start > latest_allowed_flat_start:
+        st.sidebar.warning(
+            "The pricing file does not extend through the default "
+            "48-month period. The switch to flat pricing has been "
+            "limited to "
+            f"{latest_allowed_flat_start:%B 1, %Y}."
+        )
 
     oil_col, gas_col = st.sidebar.columns(2)
 
@@ -3028,7 +3066,7 @@ else:
         oil_flat_start_date = st.date_input(
             "Switch to Flat",
             value=default_flat_start,
-            max_value=default_flat_start,
+            max_value=latest_allowed_flat_start,
             format="MM/DD/YYYY",
             key="oil_flat_start_date",
             help=(
@@ -3040,7 +3078,7 @@ else:
         oil_price = st.number_input(
             "Flat Oil ($/bbl)",
             min_value=0.0,
-            value=60.0,
+            value=70.0,
             step=1.0,
             format="%.2f",
             key="terminal_oil_price",
@@ -3052,7 +3090,7 @@ else:
         gas_flat_start_date = st.date_input(
             "Switch to Flat",
             value=default_flat_start,
-            max_value=default_flat_start,
+            max_value=latest_allowed_flat_start,
             format="MM/DD/YYYY",
             key="gas_flat_start_date",
             help=(
