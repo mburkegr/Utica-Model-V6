@@ -3,7 +3,6 @@ import hashlib
 import json
 from datetime import date
 from io import BytesIO
-from time import perf_counter
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -14,8 +13,6 @@ import base64
 from model import (
     run_deal_model,
     run_deal_metrics,
-    run_optimized_sensitivity_grid,
-    run_optimized_scenario_matrix,
     load_type_curve_library,
     load_price_file,
     prepare_slot_inputs,
@@ -360,24 +357,6 @@ def next_month_start():
     return date(today.year, today.month + 1, 1)
 
 
-def default_flat_start_date(effective_date, modeled_month_number=48):
-    """Return the first month that should use flat pricing by default.
-
-    The effective month is modeled month 1, so the first day of modeled
-    month 48 is 47 calendar months after the effective month. For example,
-    a September 1, 2026 effective date produces an August 1, 2030 flat start.
-    """
-    effective_month = (
-        pd.Timestamp(effective_date)
-        .to_period("M")
-        .to_timestamp()
-    )
-    return (
-        effective_month
-        + pd.DateOffset(months=int(modeled_month_number) - 1)
-    ).date()
-
-
 def build_slot_template(num_slots):
     rows = []
     for i in range(1, num_slots + 1):
@@ -689,27 +668,139 @@ def weighted_avg_spud_month_by_net_acres(
 
 @st.cache_data(show_spinner=False)
 def run_two_way_sensitivity(
-    base_input_signature,
-    _sensitivity_state,
+    slot_df,
+    deal_inputs,
     x_values,
     x_variable,
     y_values,
     y_variable,
 ):
-    """Run a dependency-aware IRR/MOIC sensitivity grid.
+    """Run a generic two-variable IRR and MOIC sensitivity table."""
+    irr_table = pd.DataFrame(index=y_values, columns=x_values, dtype=float)
+    moic_table = pd.DataFrame(index=y_values, columns=x_values, dtype=float)
 
-    The large reusable state is excluded from Streamlit hashing; the compact
-    base-input signature is the cache key that invalidates results when model
-    assumptions change.
-    """
-    return run_optimized_sensitivity_grid(
-        state=_sensitivity_state,
-        x_values=x_values,
-        x_variable=x_variable,
-        y_values=y_values,
-        y_variable=y_variable,
+    base_tc_risk = weighted_avg_by_net_acres(slot_df, "tc_risk")
+    base_ngl_yield = weighted_avg_by_net_acres(slot_df, "ngl_yield")
+    base_spud_month = weighted_avg_spud_month_by_net_acres(slot_df)
+    
+    base_dc_override_enabled = bool(
+        deal_inputs.get("use_dc_override", False)
+    )
+    
+    base_dc = (
+        float(deal_inputs.get("dc_override", 0.0))
+        if base_dc_override_enabled
+        else weighted_avg_by_net_acres(slot_df, "dc_costs")
     )
 
+    def apply_value(sens_slot_df, sens_deal_inputs, variable, value):
+        if variable == "spud_date":
+            target_spud_month = pd.Timestamp(value).to_period("M").to_timestamp()
+            month_delta = (
+                (target_spud_month.year - base_spud_month.year) * 12
+                + target_spud_month.month
+                - base_spud_month.month
+            )
+            sens_slot_df["drilling_spud_month"] = (
+                pd.to_datetime(
+                    sens_slot_df["drilling_spud_month"],
+                    errors="coerce",
+                )
+                + pd.DateOffset(months=int(month_delta))
+            )
+            return
+
+        value = float(value)
+
+        if variable == "bid":
+            sens_deal_inputs["use_bid_override"] = True
+            sens_deal_inputs["bid_override"] = max(1.0, value)
+
+        elif variable == "dc":
+            dc_delta = value - float(base_dc)
+        
+            if base_dc_override_enabled:
+                # A deal-level D&C override was selected in the base case,
+                # so move that uniform override up or down.
+                sens_deal_inputs["use_dc_override"] = True
+                sens_deal_inputs["dc_override"] = max(
+                    0.0,
+                    float(base_dc) + dc_delta,
+                )
+        
+            else:
+                # Preserve each slot's original D&C relationship and add
+                # the same sensitivity change to every slot.
+                sens_deal_inputs["use_dc_override"] = False
+        
+                sens_slot_df["dc_costs"] = (
+                    pd.to_numeric(
+                        sens_slot_df["dc_costs"],
+                        errors="coerce",
+                    )
+                    .fillna(0.0)
+                    + dc_delta
+                ).clip(lower=0.0)
+
+        elif variable == "oil":
+            sens_deal_inputs["oil_price"] = value
+
+        elif variable == "gas":
+            sens_deal_inputs["gas_price"] = value
+
+        elif variable == "tc_risk":
+            tc_risk_delta = value - float(base_tc_risk)
+            sens_slot_df["tc_risk"] = (
+                pd.to_numeric(
+                    sens_slot_df["tc_risk"],
+                    errors="coerce",
+                ).fillna(0.0)
+                + tc_risk_delta
+            ).clip(lower=0.0)
+
+        elif variable == "ngl_yield":
+            ngl_delta = value - float(base_ngl_yield)
+            sens_slot_df["ngl_yield"] = (
+                pd.to_numeric(
+                    sens_slot_df["ngl_yield"],
+                    errors="coerce",
+                ).fillna(0.0)
+                + ngl_delta
+            ).clip(lower=0.0)
+
+        else:
+            raise ValueError(f"Unsupported sensitivity variable: {variable}")
+
+    for y_value in y_values:
+        for x_value in x_values:
+            sens_deal_inputs = deal_inputs.copy()
+            sens_slot_df = slot_df.copy()
+
+            apply_value(
+                sens_slot_df,
+                sens_deal_inputs,
+                x_variable,
+                x_value,
+            )
+            apply_value(
+                sens_slot_df,
+                sens_deal_inputs,
+                y_variable,
+                y_value,
+            )
+
+            try:
+                irr, moic = run_deal_metrics(
+                    sens_slot_df,
+                    sens_deal_inputs,
+                )
+                irr_table.loc[y_value, x_value] = irr
+                moic_table.loc[y_value, x_value] = moic
+            except Exception:
+                irr_table.loc[y_value, x_value] = None
+                moic_table.loc[y_value, x_value] = None
+
+    return irr_table, moic_table
 
 @st.cache_data(show_spinner=False)
 def run_individual_slot_returns(slot_df, deal_inputs):
@@ -758,7 +849,6 @@ def run_individual_slot_returns(slot_df, deal_inputs):
 
     return slot_returns
 
-@st.cache_data(show_spinner=False)
 def build_heatmap(
     df,
     title,
@@ -2093,13 +2183,7 @@ def build_cumulative_fcf_chart(deal_df, slot_df):
     return fig
 
 @st.cache_data(show_spinner=False)
-def build_scenario_scatter_chart(
-    base_input_signature,
-    _sensitivity_state,
-    deal_inputs,
-    base_bid,
-    base_dc,
-):
+def build_scenario_scatter_chart(slot_df, deal_inputs, base_bid, base_dc):
     bid_values = build_sensitivity_range(
         base_bid,
         500.0,
@@ -2124,13 +2208,43 @@ def build_scenario_scatter_chart(
         ("Upside", base_oil + 5.0, base_gas + 0.25),
     ]
 
-    chart_df = run_optimized_scenario_matrix(
-        state=_sensitivity_state,
-        pricing_cases=pricing_cases,
-        dc_cases=dc_cases,
-        tc_risk_values=tc_risk_values,
-        bid_values=bid_values,
-    )
+    rows = []
+
+    for pricing_name, oil_price, gas_price in pricing_cases:
+        for dc_label, dc_value in dc_cases:
+            for tc_risk in tc_risk_values:
+                for bid in bid_values:
+                    sens_inputs = deal_inputs.copy()
+                    sens_inputs["oil_price"] = float(oil_price)
+                    sens_inputs["gas_price"] = float(gas_price)
+                    sens_inputs["use_bid_override"] = True
+                    sens_inputs["bid_override"] = float(bid)
+                    sens_inputs["use_dc_override"] = True
+                    sens_inputs["dc_override"] = float(dc_value)
+
+                    sens_slot_df = slot_df.copy()
+                    sens_slot_df["tc_risk"] = float(tc_risk)
+
+                    try:
+                        irr, moic = run_deal_metrics(sens_slot_df, sens_inputs)
+                    except Exception:
+                        irr, moic = None, None
+
+                    rows.append(
+                        {
+                            "pricing_case": pricing_name,
+                            "oil_price": oil_price,
+                            "gas_price": gas_price,
+                            "dc_case": dc_label,
+                            "dc_value": dc_value,
+                            "tc_risk": tc_risk,
+                            "bid": bid,
+                            "irr": irr,
+                            "moic": moic,
+                        }
+                    )
+
+    chart_df = pd.DataFrame(rows)
     chart_df = chart_df[pd.notnull(chart_df["irr"])].copy()
 
     color_map = {
@@ -2421,7 +2535,6 @@ def build_email_html(
     irr_oil_bid_heatmap,
     irr_gas_bid_heatmap,
     irr_oil_gas_heatmap,
-    irr_gas_dc_heatmap,
     irr_heatmap,
     irr_tcrisk_bid_heatmap,
     irr_ngl_yield_bid_heatmap,
@@ -2551,21 +2664,19 @@ def build_email_html(
             </td>
         </tr>
         <tr>
-            <td style="vertical-align:top; padding:12px 8px 0 8px;">
+            <td
+                colspan="2"
+                style="
+                    vertical-align:top;
+                    padding:12px 8px 0 8px;
+                    text-align:center;
+                "
+            >
                 {html_img_from_fig(
                     irr_oil_gas_heatmap,
                     width=1100,
                     height=450,
                     title="Oil Price vs. Gas Price IRR",
-                    max_width_px=760,
-                )}
-            </td>
-            <td style="vertical-align:top; padding:12px 8px 0 8px;">
-                {html_img_from_fig(
-                    irr_gas_dc_heatmap,
-                    width=1100,
-                    height=450,
-                    title="Gas Price vs. D&C Costs IRR",
                     max_width_px=760,
                 )}
             </td>
@@ -2649,7 +2760,7 @@ def build_email_html(
 # Bump this value whenever the editor schema or stored model-result schema
 # changes. Streamlit can retain old widget/session values across a hot reload,
 # which may leave the page blank or stuck after a deployment.
-APP_STATE_VERSION = "optimized-sensitivity-engine-pricing-v4.2-gas-dc"
+APP_STATE_VERSION = "on-demand-sensitivities-v1"
 
 if st.session_state.get("_app_state_version") != APP_STATE_VERSION:
     # Clear stale data-editor widget state and prior calculated outputs.
@@ -2669,20 +2780,6 @@ if st.session_state.get("_app_state_version") != APP_STATE_VERSION:
         "gas_flat_start_date",
         "terminal_oil_price",
         "terminal_gas_price",
-        "use_monthly_pricing_file_v3",
-        "flat_mode_oil_price_v3",
-        "flat_mode_gas_price_v3",
-        "oil_flat_start_date_v3",
-        "gas_flat_start_date_v3",
-        "terminal_oil_price_v3",
-        "terminal_gas_price_v3",
-        "use_monthly_pricing_file_v4_2",
-        "flat_mode_oil_price_v4_2",
-        "flat_mode_gas_price_v4_2",
-        "oil_flat_start_date_v4_2",
-        "gas_flat_start_date_v4_2",
-        "terminal_oil_price_v4_2",
-        "terminal_gas_price_v4_2",
     
         "model_deal_inputs",
         "deal_df",
@@ -2697,7 +2794,6 @@ if st.session_state.get("_app_state_version") != APP_STATE_VERSION:
         "deal_log_filename",
         "base_input_signature",
         "sensitivity_results",
-        "sensitivity_state",
         "base_charts",
         "base_charts_signature",
         "email_html",
@@ -2784,13 +2880,6 @@ if st.session_state["model_has_run"] and st.session_state["model_slot_df"] is No
     st.session_state["deal_df"] = None
     st.session_state["all_slots_df"] = None
 
-# Results from older app versions do not include the compact reusable
-# sensitivity state. Require one clean base rerun after this deployment.
-if st.session_state["model_has_run"] and st.session_state.get("sensitivity_state") is None:
-    st.session_state["model_has_run"] = False
-    st.session_state["deal_df"] = None
-    st.session_state["all_slots_df"] = None
-
 if "heavy_outputs_disabled" not in st.session_state:
     st.session_state["heavy_outputs_disabled"] = False
 
@@ -2802,9 +2891,6 @@ if "audit_excel_data" not in st.session_state:
 
 if "sensitivity_results" not in st.session_state:
     st.session_state["sensitivity_results"] = {}
-
-if "sensitivity_state" not in st.session_state:
-    st.session_state["sensitivity_state"] = None
 
 if "base_charts" not in st.session_state:
     st.session_state["base_charts"] = {}
@@ -2824,7 +2910,6 @@ if "use_dc_pct_sensitivity" not in st.session_state:
 st.sidebar.header("Deal-Level Inputs")
 
 st.sidebar.subheader("Output Mode")
-st.sidebar.caption("Sensitivity engine: dependency-aware v4.2")
 
 heavy_outputs_label = (
     "Enable Sensitivities / Charts / Email"
@@ -2862,12 +2947,10 @@ effective_date = st.sidebar.date_input("Effective Date", value=next_month_start(
 
 st.sidebar.subheader("Pricing")
 
-st.sidebar.caption("Pricing defaults v4.2: monthly file, 48th modeled month, $70 oil / $3.75 gas")
-
 use_monthly_pricing_file = st.sidebar.toggle(
     "Use Monthly Pricing File",
-    value=True,
-    key="use_monthly_pricing_file_v4_2",
+    value=False,
+    key="use_monthly_pricing_file",
     help=(
         "Off = use flat oil and gas prices for the entire model. "
         "On = use price_file_library.xlsx until each commodity's "
@@ -2888,10 +2971,10 @@ if pricing_mode == "flat":
         oil_price = st.number_input(
             "Oil Price ($/bbl)",
             min_value=0.0,
-            value=70.0,
+            value=60.0,
             step=1.0,
             format="%.2f",
-            key="flat_mode_oil_price_v4_2",
+            key="flat_mode_oil_price",
         )
 
     with gas_col:
@@ -2901,7 +2984,7 @@ if pricing_mode == "flat":
             value=3.75,
             step=0.05,
             format="%.3f",
-            key="flat_mode_gas_price_v4_2",
+            key="flat_mode_gas_price",
         )
 
     # These dates are ignored in flat mode.
@@ -2926,36 +3009,16 @@ else:
         pricing_preview_df["month"].max()
     )
 
-    latest_allowed_flat_start = (
+    default_flat_start = (
         last_pricing_month
         + pd.offsets.MonthBegin(1)
     ).date()
-
-    requested_default_flat_start = default_flat_start_date(
-        effective_date,
-        modeled_month_number=48,
-    )
-
-    # The pricing deck must cover every month before the flat start. If the
-    # requested 48th modeled month extends beyond the available deck, use the
-    # latest supported switch date rather than creating an invalid default.
-    default_flat_start = min(
-        requested_default_flat_start,
-        latest_allowed_flat_start,
-    )
 
     st.sidebar.caption(
         "Pricing file range: "
         f"{first_pricing_month:%b %Y} through "
         f"{last_pricing_month:%b %Y}"
     )
-
-    if requested_default_flat_start > latest_allowed_flat_start:
-        st.sidebar.warning(
-            "The pricing file does not extend through the default 48-month "
-            "forward period. The flat-pricing start has been limited to "
-            f"{latest_allowed_flat_start:%b %Y}."
-        )
 
     oil_col, gas_col = st.sidebar.columns(2)
 
@@ -2965,9 +3028,9 @@ else:
         oil_flat_start_date = st.date_input(
             "Switch to Flat",
             value=default_flat_start,
-            max_value=latest_allowed_flat_start,
+            max_value=default_flat_start,
             format="MM/DD/YYYY",
-            key="oil_flat_start_date_v4_2",
+            key="oil_flat_start_date",
             help=(
                 "The selected month uses the flat price. "
                 "The pricing file is used only for earlier months."
@@ -2977,10 +3040,10 @@ else:
         oil_price = st.number_input(
             "Flat Oil ($/bbl)",
             min_value=0.0,
-            value=70.0,
+            value=60.0,
             step=1.0,
             format="%.2f",
-            key="terminal_oil_price_v4_2",
+            key="terminal_oil_price",
         )
 
     with gas_col:
@@ -2989,9 +3052,9 @@ else:
         gas_flat_start_date = st.date_input(
             "Switch to Flat",
             value=default_flat_start,
-            max_value=latest_allowed_flat_start,
+            max_value=default_flat_start,
             format="MM/DD/YYYY",
-            key="gas_flat_start_date_v4_2",
+            key="gas_flat_start_date",
             help=(
                 "The selected month uses the flat price. "
                 "The pricing file is used only for earlier months."
@@ -3004,7 +3067,7 @@ else:
             value=3.75,
             step=0.05,
             format="%.3f",
-            key="terminal_gas_price_v4_2",
+            key="terminal_gas_price",
         )
 
     # Normalize the selected dates to the first day of each month.
@@ -3592,18 +3655,9 @@ if run_model_clicked:
             run_deal_inputs["promote_wi_reversion_pct"] = 0.0
             run_deal_inputs["promote_multiple"] = 0.0
         
-        (
-            all_slots_df,
-            deal_df,
-            slot_audit_df,
-            deal_audit_df,
-            irr,
-            moic,
-            sensitivity_state,
-        ) = run_deal_model(
+        all_slots_df, deal_df, slot_audit_df, deal_audit_df, irr, moic = run_deal_model(
             model_slot_df,
             run_deal_inputs,
-            return_sensitivity_state=True,
         )
 
         # ------------------------------------------------------------
@@ -3653,7 +3707,6 @@ if run_model_clicked:
         st.session_state["deal_log_filename"] = deal_log_filename
         st.session_state["model_deal_inputs"] = run_deal_inputs
         st.session_state["model_slot_df"] = model_slot_df
-        st.session_state["sensitivity_state"] = sensitivity_state
         st.session_state["all_slots_df"] = all_slots_df
         st.session_state["deal_df"] = deal_df
         st.session_state["slot_audit_df"] = slot_audit_df
@@ -3888,11 +3941,6 @@ if (
 
     if not disable_heavy_outputs:
         st.subheader("Sensitivity Tables")
-        st.caption(
-            "Dependency-aware engine: production and operating profiles are "
-            "reused wherever the selected variable does not change them. "
-            "Each generated table reports its actual run time."
-        )
 
         control_col1, control_col2 = st.columns(2)
         with control_col1:
@@ -4062,25 +4110,6 @@ if (
                 "base_y": deal_inputs["gas_price"],
             },
             {
-                "key": "gas_dc",
-                "title": "Gas Price vs. D&C Costs Sensitivity",
-                "x_values": gas_values,
-                "x_variable": "gas",
-                "y_values": dc_values,
-                "y_variable": "dc",
-                "x_title": "Gas Price ($/mcf)",
-                "y_title": "D&C Costs ($/ft)",
-                "x_format": "dollar",
-                "y_format": "dollar",
-                "base_x": deal_inputs["gas_price"],
-                "base_y": base_dc,
-                "caption": (
-                    "Each gas-price operating case is calculated once and reused "
-                    "across all D&C assumptions. D&C changes refresh capital, "
-                    "reversion timing, IRR, and MOIC without rebuilding production."
-                ),
-            },
-            {
                 "key": "cross_main",
                 "title": f"{cross_x_title} vs. {main_title} Sensitivity",
                 "x_values": cross_x_values,
@@ -4137,11 +4166,7 @@ if (
                 st.markdown(f"#### {spec['title']}")
             with status_col:
                 if result_is_current:
-                    elapsed = saved_result.get("elapsed_seconds")
-                    if elapsed is None:
-                        st.caption("Generated")
-                    else:
-                        st.caption(f"Generated in {elapsed:,.1f}s")
+                    st.caption("Generated")
                 elif saved_result:
                     st.caption("Needs refresh")
                 else:
@@ -4155,17 +4180,15 @@ if (
                 )
 
             if generate_clicked:
-                sensitivity_started = perf_counter()
                 with st.spinner(f"Generating {spec['title']}..."):
                     irr_df, moic_df = run_two_way_sensitivity(
-                        base_input_signature=base_input_signature,
-                        _sensitivity_state=st.session_state["sensitivity_state"],
+                        slot_df=slot_df,
+                        deal_inputs=deal_inputs,
                         x_values=spec["x_values"],
                         x_variable=spec["x_variable"],
                         y_values=spec["y_values"],
                         y_variable=spec["y_variable"],
                     )
-                elapsed_seconds = perf_counter() - sensitivity_started
                 updated_results = dict(
                     st.session_state.get("sensitivity_results", {})
                 )
@@ -4173,7 +4196,6 @@ if (
                     "irr": irr_df,
                     "moic": moic_df,
                     "signature": spec_signature,
-                    "elapsed_seconds": elapsed_seconds,
                 }
                 st.session_state["sensitivity_results"] = updated_results
                 st.session_state.pop("email_html", None)
@@ -4318,8 +4340,7 @@ if (
                     deal_df, chart_view="Stream Split"
                 )
                 scenario_chart = build_scenario_scatter_chart(
-                    base_input_signature=base_input_signature,
-                    _sensitivity_state=st.session_state["sensitivity_state"],
+                    slot_df=slot_df,
                     deal_inputs=deal_inputs,
                     base_bid=base_bid,
                     base_dc=base_dc,
@@ -4453,7 +4474,6 @@ if (
                 irr_oil_bid_heatmap=sensitivity_irr_heatmaps.get("oil_main"),
                 irr_gas_bid_heatmap=sensitivity_irr_heatmaps.get("gas_main"),
                 irr_oil_gas_heatmap=sensitivity_irr_heatmaps.get("oil_gas"),
-                irr_gas_dc_heatmap=sensitivity_irr_heatmaps.get("gas_dc"),
                 irr_heatmap=sensitivity_irr_heatmaps.get("dc_main"),
                 irr_tcrisk_bid_heatmap=sensitivity_irr_heatmaps.get("cross_main"),
                 irr_ngl_yield_bid_heatmap=sensitivity_irr_heatmaps.get("ngl_main"),
